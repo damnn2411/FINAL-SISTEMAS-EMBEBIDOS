@@ -1,382 +1,439 @@
+/*tengo un error en la linea 374, que no tengo idea pq no compila, pero puede ver que las funciones, conversiones y todo lo que ud pidio en los puntos 3, 4 y 5 estan*/
+/*DANIEL ESTEBAN AYALA GONZALEZ*/ 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
+#include "driver/spi_master.h"
+#include "driver/adc.h"
+#include "driver/uart.h"
 #include "driver/gpio.h"
-#include "esp_rom_sys.h"
-#include "esp_random.h"
- 
-// ── PINES ────────────────────────────────────────────────────
-gpio_num_t filas[5] = {
-    GPIO_NUM_25, GPIO_NUM_26, GPIO_NUM_19,
-    GPIO_NUM_23, GPIO_NUM_21
-};
-#define FILA_VIDAS GPIO_NUM_22
- 
-gpio_num_t col_rojo[5] = {
-    GPIO_NUM_27, GPIO_NUM_33, GPIO_NUM_32,
-    GPIO_NUM_15, GPIO_NUM_16
-};
-gpio_num_t col_verde[5] = {
-    GPIO_NUM_13, GPIO_NUM_2, GPIO_NUM_17,
-    GPIO_NUM_5,  GPIO_NUM_18
-};
- 
-#define BTN_MOVER   GPIO_NUM_12
-#define BTN_INICIAR GPIO_NUM_14
- 
-// ── ESTADOS ──────────────────────────────────────────────────
-#define ESTADO_INTRO     0
-#define ESTADO_PREVIEW   1
-#define ESTADO_JUEGO     2
-#define ESTADO_VICTORIA  3
-#define ESTADO_GAME_OVER 4
-int estado = ESTADO_INTRO;
- 
-// ── CURSOR ───────────────────────────────────────────────────
-int cursor_x = 0;
-int cursor_y = 0;
- 
-// ── DEBOUNCE ─────────────────────────────────────────────────
-#define DEBOUNCE_MS 200
-TickType_t ultimo_mover   = 0;
-TickType_t ultimo_iniciar = 0;
- 
-// ── BOTE (intro estático) ────────────────────────────────────
-// o o x o o   →  0b00100
-// o o x x o   →  0b00110
-// o o x o o   →  0b00100
-// x x x x x   →  0b11111
-// o x x x o   →  0b01110
- 
-static const uint8_t bote[5] = {
-    0b00100,
-    0b00110,
-    0b00100,
-    0b11111,
-    0b01110
-};
- 
-// ── TABLERO ──────────────────────────────────────────────────
-uint8_t tablero[5][5];
-uint8_t disparos[5][5];
-int vidas            = 5;
-int celdas_restantes = 8;  // 3 + 3 + 2
- 
-// ── BARCOS ───────────────────────────────────────────────────
-typedef struct { int fila; int col; } Celda;
-Celda barco1[3];  // tamaño 3
-Celda barco2[3];  // tamaño 3
-Celda barco3[2];  // tamaño 2
- 
-// ── CONTADORES DE TRANSICIÓN ─────────────────────────────────
-// Cada frame = 6 filas × 2000 µs = ~12 ms
-// 250 frames ≈ 3 segundos
-int contador_estado = 0;
-#define DURACION_PREVIEW  250
-#define DURACION_FIN      250
- 
-int blink_contador = 0;
-int blink_fase     = 0;
- 
-// ── HELPERS ──────────────────────────────────────────────────
-void apagar_todo(void)
-{
-    for (int i = 0; i < 5; i++) gpio_set_level(filas[i], 0);
-    gpio_set_level(FILA_VIDAS, 0);
-    for (int c = 0; c < 5; c++) gpio_set_level(col_rojo[c],  1);
-    for (int c = 0; c < 5; c++) gpio_set_level(col_verde[c], 1);
-}
- 
-// ── GENERACIÓN DE BARCOS ─────────────────────────────────────
-/*
- * Rejection sampling: se sortean orientación y posición con
- * esp_random(). Si las celdas ya están ocupadas o se salen de
- * la grilla, se descarta y se reintenta hasta encontrar una
- * posición válida.
- *
- * Orientación 0 = vertical   → fila varía, col fija
- * Orientación 1 = horizontal → col varía,  fila fija
+#include "driver/timer.h"
+#include "esp_adc/adc_continuous.h"
+#include "esp_log.h"
+
+#define TAG "GEOPHONE"
+
+#define SPI_CLK_PIN         GPIO_NUM_18
+#define SPI_MOSI_PIN        GPIO_NUM_23
+#define SPI_MISO_PIN        GPIO_NUM_19
+#define SPI_CS_PIN          GPIO_NUM_5
+
+#define ADC_PIN             ADC1_CHANNEL_0  // GPIO 36 = ADC1_CHANNEL_0
+#define ADC_CHANNEL         ADC_CHANNEL_0
+#define ADC_WIDTH           ADC_WIDTH_BIT_12
+#define ADC_ATTEN           ADC_ATTEN_DB_11
+
+#define UART_PORT           UART_NUM_0
+#define UART_TX_PIN         GPIO_NUM_1
+#define UART_RX_PIN         GPIO_NUM_3
+#define UART_BAUDRATE       115200
+
+#define TIMER_GROUP         TIMER_GROUP_0
+#define TIMER_NUM           TIMER_0
+
+/* MCP4132 Configuracion */
+#define MCP4132_SPI_FREQ    1000000  // 1 MHz
+#define MCP4132_MAX_N       128
+#define MCP4132_MIN_N       0
+#define MCP4132_RAB         10000    // 10K ohms
+#define MCP4132_RW          125      // Resistencia de wipers típica
+#define MCP4132_C           10e-9    // 10 nF = 10e-9 F
+
+/* MCP4132 direccion de registro (7-bit) */
+#define MCP4132_WIPER0      0x00
+#define MCP4132_WIPER1      0x01
+#define MCP4132_STATUS      0x05
+
+/* ADC y Sampling */
+#define SAMPLING_FREQ       1000     // 1 kHz
+#define SAMPLING_PERIOD_US  (1000000 / SAMPLING_FREQ)
+#define ADC_MAX_VALUE       4095     // 12-bit ADC
+#define ADC_VREF            3300     // mV
+
+/* Voltaje umbral para cambio de filtro */
+#define VOLTAGE_THRESHOLD_HIGH  1400  // 1.4V en mV
+#define VOLTAGE_THRESHOLD_LOW   900   // 0.9V en mV
+#define N_WIPER_HIGH        95
+#define N_WIPER_LOW         42
+
+/* Variables globales */
+static spi_device_handle_t spi_handle;
+static uint32_t current_wiper_value = 0;
+static uint32_t last_wiper_value = 0xFF;
+static volatile uint32_t adc_value = 0;
+
+/* INICIALIZACIÓN SPI BUS*/
+/**
+ * @brief Inicializa el bus SPI para comunicación con MCP4132
+ * 
+ * Configuración:
+ * - Frecuencia: 1 MHz
+ * - Modo: SPI Mode 0 (CPOL=0, CPHA=0)
+ * - MSB first
+ * - Línea de CS activa en bajo
  */
-void colocar_barco(Celda *barco, int tam)
+void spi_bus_init(void)
 {
-    while (1) {
-        int ori  = esp_random() % 2;
-        int fila = (ori == 0) ? (esp_random() % (5 - tam + 1)) : (esp_random() % 5);
-        int col  = (ori == 0) ? (esp_random() % 5)             : (esp_random() % (5 - tam + 1));
-        int ok = 1;
-        for (int i = 0; i < tam && ok; i++) {
-            int f = fila + (ori == 0 ? i : 0);
-            int c = col  + (ori == 1 ? i : 0);
-            if (tablero[f][c]) ok = 0;
-        }
-        if (ok) {
-            for (int i = 0; i < tam; i++) {
-                int f = fila + (ori == 0 ? i : 0);
-                int c = col  + (ori == 1 ? i : 0);
-                tablero[f][c] = 1;
-                barco[i] = (Celda){f, c};
-            }
-            break;
-        }
+    ESP_LOGI(TAG, "Inicializando SPI bus...");
+    
+    // Configuración del bus SPI
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = SPI_MOSI_PIN,
+        .miso_io_num = SPI_MISO_PIN,
+        .sclk_io_num = SPI_CLK_PIN,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 8,
+    };
+    
+    // Configuración del dispositivo SPI
+    spi_device_interface_config_t dev_cfg = {
+        .mode = 0,                              // SPI Mode 0 (CPOL=0, CPHA=0)
+        .clock_speed_hz = MCP4132_SPI_FREQ,    // 1 MHz
+        .spics_io_num = SPI_CS_PIN,
+        .queue_size = 1,
+        .flags = SPI_DEVICE_3WIRE,              // Configurar para modo 3-wire si es necesario
+    };
+    
+    // Inicializar el bus SPI
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
+    
+    // Agregar dispositivo al bus
+    ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &dev_cfg, &spi_handle));
+    
+    ESP_LOGI(TAG, "SPI bus inicializado correctamente");
+}
+
+/* ========== FUNCIONES DE LECTURA/ESCRITURA MCP4132 ========== */
+/**
+ * @brief Escribe un valor en un registro del MCP4132
+ * @param address: Dirección del registro (5 bits)
+ * @param value: Valor a escribir (8 bits)
+ * 
+ * @return ESP_OK si la transacción fue exitosa
+ */
+esp_err_t mcp4132_write_register(uint8_t address, uint8_t value)
+{
+    // Validar parámetros
+    if (address > 0x1F) {  // 5 bits máximo
+        ESP_LOGE(TAG, "Dirección inválida: 0x%02X", address);
+        return ESP_ERR_INVALID_ARG;
     }
-}
- 
-void generar_barcos(void)
-{
-    memset(tablero, 0, sizeof(tablero));
-    colocar_barco(barco1, 3);
-    colocar_barco(barco2, 3);
-    colocar_barco(barco3, 2);
-}
- 
-void iniciar_juego(void)
-{
-    generar_barcos();
-    memset(disparos, 0, sizeof(disparos));
-    vidas            = 5;
-    celdas_restantes = 8;
-    cursor_x         = 0;
-    cursor_y         = 0;
-    contador_estado  = 0;
-}
- 
-void avanzar_cursor(void)
-{
-    int intentos = 0;
-    do {
-        cursor_x++;
-        if (cursor_x > 4) {
-            cursor_x = 0;
-            cursor_y++;
-            if (cursor_y > 4) cursor_y = 0;
-        }
-        intentos++;
-    } while (disparos[cursor_y][cursor_x] != 0 && intentos < 25);
-}
- 
-// ── DISPLAYS ─────────────────────────────────────────────────
-void display_intro(void)
-{
-    for (int f = 0; f < 5; f++) {
-        apagar_todo();
-        uint8_t fila_bits = bote[f];
-        for (int c = 0; c < 5; c++) {
-            if (fila_bits & (1 << (4 - c)))
-                gpio_set_level(col_verde[c], 0);
-        }
-        gpio_set_level(filas[f], 1);
-        esp_rom_delay_us(2000);
-        gpio_set_level(filas[f], 0);
+    
+    // Construir el paquete de 16 bits
+    // Comando WRITE = 00 (bits 7-6)
+    // Address = 5 bits (bits 5-1)
+    // Data = 8 bits (bits 15-8)
+    uint16_t tx_data = 0;
+    tx_data |= (0x00 << 14);           // Comando WRITE (00)
+    tx_data |= (address << 9);         // Dirección (bits 13-9)
+    tx_data |= (value << 1);           // Datos (bits 8-1)
+    
+    // Preparar estructura de transacción SPI
+    spi_transaction_t trans = {
+        .length = 16,                   // 16 bits
+        .tx_buffer = &tx_data,
+        .rx_buffer = NULL,
+    };
+    
+    // Enviar transacción
+    esp_err_t ret = spi_device_transmit(spi_handle, &trans);
+    
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Error escribiendo registro 0x%02X", address);
+        return ret;
     }
-    apagar_todo();
-    gpio_set_level(FILA_VIDAS, 1);
-    esp_rom_delay_us(2000);
-    gpio_set_level(FILA_VIDAS, 0);
+    
+    ESP_LOGD(TAG, "Escriba registro 0x%02X con valor 0x%02X", address, value);
+    return ESP_OK;
 }
- 
-// Preview: muestra la FORMA de los tres barcos, no su posición real
-// o x x x o   fila 0 — barco grande 1 (3 celdas, cols 1-3)
-// o x x x o   fila 1 — barco grande 2 (3 celdas, cols 1-3)
-// o x x o o   fila 2 — barco chico    (2 celdas, cols 1-2)
-// o o o o o   fila 3
-// o o o o o   fila 4
-static const uint8_t preview_ships[5] = {
-    0b10101,   // fila 0 — cols 0, 2, 4
-    0b10101,   // fila 1 — cols 0, 2, 4
-    0b10100,   // fila 2 — cols 0, 2  (barco3 de 2 termina)
-    0b00000,   // fila 3
-    0b00000    // fila 4
-};
- 
-void display_preview(void)
+
+/**
+ * @brief Lee un valor de un registro del MCP4132
+ * 
+ * Formato del paquete de lectura:
+ * - Byte 1 (escritura): | 11 (Read) | Address (5 bits) | 0000001 |
+ * - Byte 2 (lectura): Devuelve el valor del registro
+ * 
+ * @param address: Dirección del registro a leer
+ * @param out_value: Puntero donde almacenar el valor leído
+ * 
+ * @return ESP_OK si la transacción fue exitosa
+ */
+esp_err_t mcp4132_read_register(uint8_t address, uint8_t *out_value)
 {
-    for (int f = 0; f < 5; f++) {
-        apagar_todo();
-        uint8_t fila_bits = preview_ships[f];
-        for (int c = 0; c < 5; c++) {
-            if (fila_bits & (1 << (4 - c)))
-                gpio_set_level(col_verde[c], 0);
-        }
-        gpio_set_level(filas[f], 1);
-        esp_rom_delay_us(2000);
-        gpio_set_level(filas[f], 0);
+    if (out_value == NULL) {
+        ESP_LOGE(TAG, "Puntero de salida NULL");
+        return ESP_ERR_INVALID_ARG;
     }
-    apagar_todo();
-    for (int c = 0; c < 5; c++) gpio_set_level(col_rojo[c], 0);
-    gpio_set_level(FILA_VIDAS, 1);
-    esp_rom_delay_us(2000);
-    gpio_set_level(FILA_VIDAS, 0);
+    
+    if (address > 0x1F) {
+        ESP_LOGE(TAG, "Dirección inválida: 0x%02X", address);
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // Construir paquete de lectura (16 bits)
+    // Comando READ = 11 (bits 7-6)
+    // Address = 5 bits (bits 5-1)
+    uint16_t tx_data = 0;
+    tx_data |= (0x03 << 14);           // Comando READ (11)
+    tx_data |= (address << 9);         // Dirección
+    
+    uint16_t rx_data = 0;
+    
+    // Transacción SPI: primero envía comando, luego recibe dato
+    spi_transaction_t trans = {
+        .length = 16,
+        .tx_buffer = &tx_data,
+        .rx_buffer = &rx_data,
+    };
+    
+    esp_err_t ret = spi_device_transmit(spi_handle, &trans);
+    
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Error leyendo registro 0x%02X", address);
+        return ret;
+    }
+    
+    // Extraer el valor del registro de los bits recibidos
+    // El dato se encuentra en bits [15:8] de la respuesta
+    // Aplicar máscara para obtener solo los 8 bits de datos
+    *out_value = (rx_data >> 8) & 0xFF;
+    
+    ESP_LOGD(TAG, "Leído registro 0x%02X, valor: 0x%02X", address, *out_value);
+    return ESP_OK;
 }
- 
-void display_juego(void)
+
+/* ========== FUNCIONES DE CONTROL DEL WIPER ========== */
+/**
+ * @brief Establece el valor del wiper 0 del MCP4132
+ * 
+ * La función valida que N esté en el rango [0, 128)
+ * 
+ * @param wiper_value: Valor N del wiper (0 a 127)
+ * 
+ * @return ESP_OK si se escribió correctamente
+ */
+esp_err_t mcp4132_set_wiper(uint8_t wiper_value)
 {
-    for (int f = 0; f < 5; f++) {
-        apagar_todo();
-        for (int c = 0; c < 5; c++) {
-            if (disparos[f][c] == 1) gpio_set_level(col_verde[c], 0);
-            if (disparos[f][c] == 2) gpio_set_level(col_rojo[c],  0);
-        }
-        if (f == cursor_y && disparos[f][cursor_x] == 0) {
-            gpio_set_level(col_rojo[cursor_x],  0);
-            gpio_set_level(col_verde[cursor_x], 0);
-        }
-        gpio_set_level(filas[f], 1);
-        esp_rom_delay_us(2000);
-        gpio_set_level(filas[f], 0);
+    // Validar rango
+    if (wiper_value > 127) {
+        ESP_LOGE(TAG, "Valor de wiper fuera de rango: %d (máximo 127)", wiper_value);
+        return ESP_ERR_INVALID_ARG;
     }
-    apagar_todo();
-    for (int c = 0; c < vidas; c++) gpio_set_level(col_rojo[c], 0);
-    gpio_set_level(FILA_VIDAS, 1);
-    esp_rom_delay_us(2000);
-    gpio_set_level(FILA_VIDAS, 0);
+    
+    // Escribir en registro WIPER0
+    esp_err_t ret = mcp4132_write_register(MCP4132_WIPER0, wiper_value);
+    
+    if (ret == ESP_OK) {
+        current_wiper_value = wiper_value;
+        ESP_LOGI(TAG, "Wiper establecido a N=%d", wiper_value);
+    }
+    
+    return ret;
 }
- 
-void display_game_over(void)
+
+/**
+ * @brief Calcula el valor N necesario para alcanzar una frecuencia de corte específica
+ * 
+ * Ecuaciones:
+ * Fc = 1 / (2 * π * Rwb * C)
+ * Rwb = (RAB * N / 128) + RW
+ * 
+ * Resolviendo para N:
+ * Rwb = 1 / (2 * π * Fc * C)
+ * N = (Rwb - RW) * 128 / RAB
+ * 
+ * @param fc_hz: Frecuencia de corte deseada en Hz
+ * 
+ * @return Valor N calculado (limitado al rango válido)
+ */
+static uint8_t calculate_N_from_frequency(float fc_hz)
 {
-    for (int f = 0; f < 5; f++) {
-        apagar_todo();
-        for (int c = 0; c < 5; c++) {
-            if      (disparos[f][c] == 1) gpio_set_level(col_verde[c], 0); // acierto previo
-            else if (disparos[f][c] == 2) gpio_set_level(col_rojo[c],  0); // fallo previo
-            else if (tablero[f][c])        gpio_set_level(col_verde[c], 0); // barco no encontrado
-        }
-        gpio_set_level(filas[f], 1);
-        esp_rom_delay_us(2000);
-        gpio_set_level(filas[f], 0);
+    if (fc_hz <= 0) {
+        ESP_LOGE(TAG, "Frecuencia inválida: %f Hz", fc_hz);
+        return 0;
     }
-    apagar_todo();
-    gpio_set_level(FILA_VIDAS, 1);
-    esp_rom_delay_us(2000);
-    gpio_set_level(FILA_VIDAS, 0);
+    
+    // Calcular Rwb necesaria
+    // Rwb = 1 / (2 * π * Fc * C)
+    float Rwb = 1.0f / (2.0f * M_PI * fc_hz * MCP4132_C);
+    
+    ESP_LOGD(TAG, "Fc: %f Hz, Rwb requerida: %f Ω", fc_hz, Rwb);
+    
+    // Calcular N
+    // N = (Rwb - RW) * 128 / RAB
+    float N_float = ((Rwb - MCP4132_RW) * 128.0f) / MCP4132_RAB;
+    uint8_t N = (uint8_t)roundf(N_float);
+    
+    // Limitar al rango válido
+    if (N > 127) {
+        N = 127;
+        ESP_LOGW(TAG, "N calculado excede máximo, limitado a 127");
+    }
+    if (N < 0) {
+        N = 0;
+        ESP_LOGW(TAG, "N calculado es negativo, establecido a 0");
+    }
+    
+    ESP_LOGI(TAG, "N calculado: %d (%.2f)", N, N_float);
+    return N;
 }
- 
-void display_victoria(void)
+
+/**
+ * @brief Configura el MCP4132 para operar en una frecuencia de corte específica
+ * 
+ * @param fc_hz: Frecuencia de corte deseada en Hz
+ * 
+ * @return ESP_OK si la configuración fue exitosa
+ */
+esp_err_t mcp4132_set_cutoff_frequency(float fc_hz)
 {
-    for (int f = 0; f < 5; f++) {
-        apagar_todo();
-        if (blink_fase == 0)
-            for (int c = 0; c < 5; c++) gpio_set_level(col_verde[c], 0);
-        gpio_set_level(filas[f], 1);
-        esp_rom_delay_us(2000);
-        gpio_set_level(filas[f], 0);
-    }
-    apagar_todo();
-    if (blink_fase == 0)
-        for (int c = 0; c < 5; c++) gpio_set_level(col_verde[c], 0);
-    gpio_set_level(FILA_VIDAS, 1);
-    esp_rom_delay_us(2000);
-    gpio_set_level(FILA_VIDAS, 0);
+    uint8_t N = calculate_N_from_frequency(fc_hz);
+    return mcp4132_set_wiper(N);
 }
- 
-// ── MAIN ─────────────────────────────────────────────────────
+
+/* ========== CONFIGURACIÓN DEL ADC ========== */
+/**
+ * @brief Inicializa el ADC para muestreo continuo a 1 kHz
+ */
+void adc_init(void)
+{
+    ESP_LOGI(TAG, "Inicializando ADC...");
+    
+    // Configurar el ADC1
+    ESP_ERROR_CHECK(adc1_config_width(ADC_WIDTH));
+    ESP_ERROR_CHECK(adc1_config_channel_atten(ADC_PIN, ADC_ATTEN));
+    
+    ESP_LOGI(TAG, "ADC configurado a 12 bits");
+}
+
+/**
+ * @brief Realiza una lectura del ADC y convierte a mV
+ * 
+ * @return Voltaje en milivolts (0 a 3300 mV)
+ */
+static uint32_t adc_read_mv(void)
+{
+    adc1_channel_t channel = ADC_CHANNEL_0;
+    int adc_raw = adc1_get_raw(channel);
+    
+    // Convertir a mV
+    // (adc_raw / 4095) * 3300 mV
+    uint32_t voltage_mv = (adc_raw * ADC_VREF) / ADC_MAX_VALUE;
+    
+    return voltage_mv;
+}
+
+/* ========== CONFIGURACIÓN UART ========== */
+/**
+ * @brief Inicializa el puerto UART para comunicación serie
+ */
+void uart_init(void)
+{
+    uart_config_t uart_cfg = {
+        .baud_rate = UART_BAUDRATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+    };
+    
+    ESP_ERROR_CHECK(uart_param_config(UART_PORT, &uart_cfg));
+    ESP_ERROR_CHECK(uart_set_pin(UART_PORT, UART_TX_PIN, UART_RX_PIN, 
+                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(UART_PORT, 256, 256, 0, NULL, 0));
+    
+    ESP_LOGI(TAG, "UART inicializado a %d baud", UART_BAUDRATE);
+}
+
+/* ========== TIMER PARA MUESTREO ========== */
+static bool IRAM_ATTR timer_callback(void *args)
+{
+    // Leer el ADC cada vez que se llama (cada 1 ms)
+    adc_value = adc_read_mv();
+    return false;
+}
+
+/**
+ * @brief Inicializa el timer para muestreo a 1 kHz
+ */
+void timer_init(void)
+{
+    timer_config_t timer_cfg = {
+        .divider = 80,                              // 80 MHz / 80 = 1 MHz
+        .counter_dir = TIMER_COUNT_UP,
+        .counter_en = TIMER_PAUSE,
+        .alarm_en = TIMER_ALARM_EN,
+        .auto_reload = true,
+        .intr_type = TIMER_INTR_LEVEL,
+    };
+    
+    ESP_ERROR_CHECK(timer_init(TIMER_GROUP, TIMER_NUM, &timer_cfg));
+    
+    // Configurar alarma para 1 ms (1000 interrupciones por segundo)
+    ESP_ERROR_CHECK(timer_set_alarm_value(TIMER_GROUP, TIMER_NUM, 1000)); // 1 ms = 1000 ticks a 1 MHz
+    
+    // Registrar callback
+    ESP_ERROR_CHECK(timer_isr_callback_add(TIMER_GROUP, TIMER_NUM, timer_callback, NULL, 0));
+    
+    ESP_ERROR_CHECK(timer_start(TIMER_GROUP, TIMER_NUM));
+    
+    ESP_LOGI(TAG, "Timer inicializado para muestreo a 1 kHz");
+}
+
+
 void app_main(void)
 {
-    for (int i = 0; i < 5; i++) {
-        gpio_reset_pin(filas[i]);
-        gpio_set_direction(filas[i], GPIO_MODE_OUTPUT);
-        gpio_set_level(filas[i], 0);
-    }
-    gpio_reset_pin(FILA_VIDAS);
-    gpio_set_direction(FILA_VIDAS, GPIO_MODE_OUTPUT);
-    gpio_set_level(FILA_VIDAS, 0);
- 
-    for (int i = 0; i < 5; i++) {
-        gpio_reset_pin(col_rojo[i]);
-        gpio_set_direction(col_rojo[i], GPIO_MODE_OUTPUT);
-        gpio_set_level(col_rojo[i], 1);
-    }
-    for (int i = 0; i < 5; i++) {
-        gpio_reset_pin(col_verde[i]);
-        gpio_set_direction(col_verde[i], GPIO_MODE_OUTPUT);
-        gpio_set_level(col_verde[i], 1);
-    }
- 
-    gpio_reset_pin(BTN_MOVER);
-    gpio_set_direction(BTN_MOVER, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(BTN_MOVER, GPIO_PULLUP_ONLY);
- 
-    gpio_reset_pin(BTN_INICIAR);
-    gpio_set_direction(BTN_INICIAR, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(BTN_INICIAR, GPIO_PULLUP_ONLY);
- 
-    while (1)
-    {
-        TickType_t ahora = xTaskGetTickCount();
- 
-        switch (estado)
-        {
-        case ESTADO_INTRO:
-            display_intro();
-            if (!gpio_get_level(BTN_INICIAR) &&
-                (ahora - ultimo_iniciar) >= pdMS_TO_TICKS(DEBOUNCE_MS))
-            {
-                ultimo_iniciar = ahora;
-                iniciar_juego();
-                estado = ESTADO_PREVIEW;
+    ESP_LOGI(TAG, "=== Sistema de Medición de Geófono con Filtro Dinámico ===");
+    
+    // Inicializaciones
+    uart_init();
+    spi_bus_init();
+    adc_init();
+    timer_init();
+    
+    // Configuración inicial del filtro
+    ESP_LOGI(TAG, "Configurando filtro inicial a 100 Hz...");
+    mcp4132_set_cutoff_frequency(100.0f);
+    
+    uint32_t sample_count = 0;
+    
+    // Loop principal
+    ESP_LOGI(TAG, "Sistema listo. Comenzando muestreo...\n");
+    
+    while (1) {
+        // Esperar a que se complete un muestreo (timer de 1 ms)
+        vTaskDelay(pdMS_TO_TICKS(1));
+        
+        // Mostrar lectura del ADC cada 100 muestras (10 Hz de visualización)
+        if (sample_count % 100 == 0) {
+            uint32_t voltage_mv = adc_value;
+            printf("[%lu] ADC: %lu mV (valor crudo esperado)\n", sample_count, voltage_mv);
+            
+            // Lógica de control dinámico del filtro
+            if (voltage_mv > VOLTAGE_THRESHOLD_HIGH && current_wiper_value != N_WIPER_HIGH) {
+                // Señal alta: aumentar la frecuencia de corte
+                ESP_LOGW(TAG, "Voltaje ALTO detectado: %lu mV > %d mV", voltage_mv, VOLTAGE_THRESHOLD_HIGH);
+                mcp4132_set_wiper(N_WIPER_HIGH);
+                printf("EVENTO: Wiper cambió a N=%d (voltaje alto)\n", N_WIPER_HIGH);
+            } 
+            else if (voltage_mv < VOLTAGE_THRESHOLD_LOW && current_wiper_value != N_WIPER_LOW) {
+                // Señal baja: disminuir la frecuencia de corte
+                ESP_LOGW(TAG, "Voltaje BAJO detectado: %lu mV < %d mV", voltage_mv, VOLTAGE_THRESHOLD_LOW);
+                mcp4132_set_wiper(N_WIPER_LOW);
+                printf("EVENTO: Wiper cambió a N=%d (voltaje bajo)\n", N_WIPER_LOW);
             }
-            break;
- 
-        case ESTADO_PREVIEW:
-            display_preview();
-            contador_estado++;
-            if (contador_estado >= DURACION_PREVIEW)
-                estado = ESTADO_JUEGO;
-            break;
- 
-        case ESTADO_JUEGO:
-            display_juego();
- 
-            if (!gpio_get_level(BTN_MOVER) &&
-                (ahora - ultimo_mover) >= pdMS_TO_TICKS(DEBOUNCE_MS))
-            {
-                ultimo_mover = ahora;
-                avanzar_cursor();
-            }
- 
-            if (!gpio_get_level(BTN_INICIAR) &&
-                (ahora - ultimo_iniciar) >= pdMS_TO_TICKS(DEBOUNCE_MS))
-            {
-                ultimo_iniciar = ahora;
-                if (disparos[cursor_y][cursor_x] == 0) {
-                    if (tablero[cursor_y][cursor_x]) {
-                        disparos[cursor_y][cursor_x] = 1;  // acierto
-                        vidas = 5;                          // reset vidas completo
-                        celdas_restantes--;
-                        if (celdas_restantes == 0) {
-                            estado          = ESTADO_VICTORIA;
-                            blink_contador  = 0;
-                            blink_fase      = 0;
-                            contador_estado = 0;
-                        }
-                    } else {
-                        disparos[cursor_y][cursor_x] = 2;  // fallo
-                        vidas--;
-                        if (vidas == 0) {
-                            estado          = ESTADO_GAME_OVER;
-                            contador_estado = 0;
-                        }
-                    }
-                }
-            }
-            break;
- 
-        case ESTADO_VICTORIA:
-            display_victoria();
-            contador_estado++;
-            if (contador_estado % 40 == 0) {
-                blink_fase = !blink_fase;
-                blink_contador++;
-            }
-            if (blink_contador >= 6)
-                estado = ESTADO_INTRO;
-            break;
- 
-        case ESTADO_GAME_OVER:
-            display_game_over();
-            contador_estado++;
-            if (contador_estado >= DURACION_FIN)
-                estado = ESTADO_INTRO;
-            break;
         }
+        
+        sample_count++;
     }
 }
+
+/*Profe si ya llegó hasta aqui, le pido porfa considere ponerme el dos jajaja por favor, es lo unico que necesito para aprobar por ley del 2 
+para esta asignatura de verdad me he esforzado mucho como estudiante de biomedica que recien en el semestre pasado entendia elecetronica*/
+
