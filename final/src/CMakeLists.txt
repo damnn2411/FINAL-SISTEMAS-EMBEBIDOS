@@ -1,6 +1,11 @@
-# This file was automatically generated for projects
-# without default 'CMakeLists.txt' file.
+cmake_minimum_required(VERSION 3.16)
 
-FILE(GLOB_RECURSE app_sources ${CMAKE_SOURCE_DIR}/src/*.*)
+project(esp32_geophone_filter)
 
-idf_component_register(SRCS ${app_sources})
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+
+idf_component_register(
+    SRCS "main.c"
+    INCLUDE_DIRS "."
+    REQUIRES driver esp_adc freertos
+)
